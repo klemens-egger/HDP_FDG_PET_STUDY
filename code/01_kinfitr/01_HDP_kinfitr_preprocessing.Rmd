@@ -1,0 +1,639 @@
+---
+title: "01_HDP_kinfitr_preprocessing"
+output: html_document
+date: "2025-12-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup
+
+## Packages
+
+```{r}
+# remotes::install_github("mathesong/bloodstream")
+# remotes::install_github("mathesong/kinfitr")
+
+rm(list = ls())  # Clear all objects from the workspace
+
+library(tidyverse)
+library(bloodstream)
+library(kinfitr)
+library(job)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggpubr)
+library(jsonlite)
+
+theme_set(theme_light())
+
+```
+
+# Loading Data
+
+## Loading IDIF and participants.tsv files
+
+```{r}
+suppressWarnings({
+
+find_repo_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  repeat {
+    if (file.exists(file.path(current, "config", "paths.json"))) {
+      return(current)
+    }
+    parent <- dirname(current)
+    if (identical(parent, current)) {
+      stop("Could not locate repo root containing config/paths.json")
+    }
+    current <- parent
+  }
+}
+repo_root <- find_repo_root(getwd())
+source(file.path(repo_root, "code", "utils", "project_paths.R"))
+paths <- load_project_paths(repo_root)
+bids_dir <- paths$bids_root
+kinfitr_output_dir <- file.path(paths$kinfitr_output_root)
+
+# Define the paths relative to the base path
+idif_path <- file.path(bids_dir, "derivatives/idif_aorta")
+participants_file <- file.path(bids_dir, "participants.tsv")
+
+# Read the participants.tsv file
+participants <- read.delim(participants_file)
+
+# Initialize an empty dataframe to store results
+idif_data <- tibble(
+  ses = character(),
+  sub = character(),
+  condition = character(), # Add the condition column
+  task = character(),
+  trc = character(),
+  acq = character(),
+  run = character(),
+  rec = character(),
+  input_idif = list(),
+  input = list(), # this will be formatted as needed by kinfitr
+  input_feng = list() # add the input function with Feng model
+)
+
+glc_data  <- tibble(
+  ses = character(),
+  sub = character(),
+  condition = character(), # Add the condition column
+  task = character(),
+  trc = character(),
+  acq = character(),
+  run = character(),
+  rec = character(),
+  glc_conc = numeric()
+)
+
+# Traverse the derivatives folder to find the relevant files
+files <- list.files(path = idif_path, pattern = "inputfunction\\.tsv", full.names = TRUE, recursive = TRUE)
+
+# Process each file
+for (file in files) {
+  # Extract sub and ses from the filename
+  filename <- basename(file)
+  sub <- gsub("sub-(HDP[0-9]+)_.*", "\\1", filename)
+  ses <- gsub(".*_ses-([0-9]+)_.*", "\\1", filename)
+  
+  print(paste("Processing participant", sub, "session", ses)) 
+  
+  # Read the original input function file
+  input_data <- read.delim(file)
+  
+  # Add timepoint 0 to the dataframe
+  zero_row <- input_data[1,] %>% mutate(across(everything(), ~0))
+  input_data <- bind_rows(zero_row, input_data)
+  
+  # Extract original timepoints and frame info
+  original_times <- input_data$time
+  frame_info <- input_data %>% select(Frame, FrameTimesStart, FrameDuration)
+  
+  # Determine the drug condition based on the session
+  condition <- ifelse(ses == "01", 
+                      participants$drug_ses.01[participants$participant_id == paste0("sub-", sub)], 
+                      participants$drug_ses.02[participants$participant_id == paste0("sub-", sub)])
+  
+  ### Calculate blood plasma concentration from population red blood cell to plasma ratio (Phelps et al. 1979)
+  t_min <- input_data$time / 60   # Time in minutes
+  rbc_plasma <- 0.8 + 0.0012 * t_min      # [RBC]/[plasma] ratio r(t) from Phelps
+  H <- 0.42 # Hematocrit (otherwise assume 0.42)
+  denom <- H * rbc_plasma + (1 - H) # Denominator H * r(t) + (1 - H)
+  plasma_idif <- input_data$IDIF / denom   # Plasma TAC from whole blood
+
+  
+  # Use blood_interp() to create the input list based on input_idif data
+  input <- blood_interp(
+    t_blood      = t_min,
+    blood        = input_data$IDIF,   # whole blood
+    t_plasma     = t_min,
+    plasma       = plasma_idif,       # corrected plasma
+    t_parentfrac = t_min,
+    parentfrac   = 1 # Assuming constant for FDG
+  )
+
+  # Fit the Feng model on whole-blood IDIF
+  fengfit <- blmod_feng(input_data$time, input_data$IDIF)
+
+  # Generate smooth predictions (whole-blood curve)
+  fengpred <- tibble(time = seq(0, max(input_data$time), length.out = 1000))
+  fengpred$IDIF <- predict(fengfit, newdata = fengpred)
+
+  # Calculate plasma TAC from Feng whole-blood IDIF using the same RBC/plasma model
+  t_min_feng <- fengpred$time / 60
+  rbc_plasma_feng <- 0.8 + 0.0012 * t_min_feng
+  denom_feng <- H * rbc_plasma_feng + (1 - H)
+  plasma_idif_feng <- fengpred$IDIF / denom_feng
+
+  # Convert to the required format for kinfitr
+  input_feng <- blood_interp(
+    t_blood      = t_min_feng,
+    blood        = fengpred$IDIF,      # whole blood
+    t_plasma     = t_min_feng,
+    plasma       = plasma_idif_feng,   # corrected plasma
+    t_parentfrac = t_min_feng,
+    parentfrac   = 1
+  )
+
+  # Create a dataframe for Feng-modeled storage (Time remains in seconds here)
+  feng_df <- tibble(
+    Time           = fengpred$time,
+    Blood          = fengpred$IDIF,        # whole blood
+    Plasma         = plasma_idif_feng,     # corrected plasma
+    ParentFraction = 1,
+    AIF            = plasma_idif_feng      # plasma-based AIF
+  )
+
+  # Define the output directory
+  output_dir <- dirname(file)
+  feng_tsv_path <- file.path(output_dir, paste0("sub-", sub, "_ses-", ses, "_inputfunction_feng_modeled.tsv"))
+  feng_json_path <- file.path(output_dir, paste0("sub-", sub, "_ses-", ses, "_inputfunction_feng_modeled.json"))
+
+  # Save the Feng modeled data as TSV
+  write.table(feng_df, file = feng_tsv_path, sep = "\t", row.names = FALSE, quote = FALSE)
+
+  # Create BIDS-compliant JSON metadata
+  feng_json <- list(
+    Description = "Arterial Input function derived from original IDIF inputfunction.tsv created with blmod_feng function from kinfitr package.",
+    Time = list(
+      Description = "Reference time for the frame in relation to time zero defined in _pet.json",
+      Units = "s"
+    ),
+    Blood = list(
+      Description = "Radioactivity concentration in whole blood",
+      Units = "Bq/mL"
+    ),
+    Plasma = list(
+      Description = "Radioactivity concentration in plasma",
+      Units = "Bq/mL"
+    ),
+    ParentFraction = list(
+      Description = "Fraction of parent compound in plasma",
+      Units = "unitless"
+    ),
+    AIF = list(
+      Description = "Arterial input function derived from modeled blood data",
+      Units = "Bq/mL"
+    )
+  )
+
+  # Save JSON metadata
+  write_json(feng_json, path = feng_json_path, pretty = TRUE)
+  
+  print(paste("Saved:", feng_tsv_path))
+
+  ## ---- Store Back-Translated Feng Data (Original Format) ---- ##
+  
+  # Interpolate AIF values to match the original timepoints
+  interpolated_aif <- approx(x = feng_df$Time, y = feng_df$AIF, xout = original_times, method = "linear")$y
+
+  # Create a dataframe with original format
+  feng_original_format <- tibble(
+    time = original_times,
+    IDIF = interpolated_aif,
+    Frame = frame_info$Frame,
+    FrameTimesStart = frame_info$FrameTimesStart,
+    FrameDuration = frame_info$FrameDuration
+  )
+  
+  # Remove the row where Frame == 0
+  feng_original_format <- feng_original_format %>% filter(Frame != 0)
+
+  
+  # Define the output paths
+  feng_original_tsv_path <- file.path(output_dir, paste0("sub-", sub, "_ses-", ses, "_inputfunction_feng_original_format.tsv"))
+  feng_original_json_path <- file.path(output_dir, paste0("sub-", sub, "_ses-", ses, "_inputfunction_feng_original_format.json"))
+
+  # Save the new TSV file
+  write.table(feng_original_format, file = feng_original_tsv_path, sep = "\t", row.names = FALSE, quote = FALSE)
+
+  # Create JSON metadata
+  feng_original_json <- list(
+      Description = "Arterial Input function derived from original IDIF inputfunction.tsv created with blmod_feng function from kinfitr package and reverted back to the original format found in inputfunction.tsv files.",
+    time = list(
+      Description = "Reference time for the frame in relation to time zero defined in _pet.json",
+      Units = "s"
+    ),
+    IDIF = list(
+      Description = "Inputfunction derived from IDIF and modeled with Feng model provided by kinfitr funtion 'blmod_feng'",
+      Units = "Bq/mL"
+    ),
+    Frame = list(
+      Description = "Frame index",
+      Units = "unitless"
+    ),
+    FrameTimesStart = list(
+      Description = "Time of frame start in relation to time zero defined in _pet.json",
+      Units = "s"
+    ),
+    FrameDuration = list(
+      Description = "Time of frame start in relation to time zero defined in _pet.json",
+      Units = "s"
+    )
+  )
+
+  # Save JSON metadata
+  write_json(feng_original_json, path = feng_original_json_path, pretty = TRUE)
+
+  print(paste("Saved:", feng_original_tsv_path))
+
+  ## ---- Add to DataFrames for Further Processing ---- ##
+  
+  # Add a new row to the dataframe
+  idif_data <- idif_data %>%
+    add_row(
+      ses = ses,
+      sub = sub,
+      condition = condition,
+      task = "rest",
+      trc = "trc",
+      acq = "acq",
+      run = "01",
+      rec = "rec",
+      input_idif = list(input_data),
+      input = list(input),
+      input_feng = list(input_feng)
+    )
+
+  # Extract the glucose concentration
+  glc_conc <- ifelse(ses == "01", 
+                     participants$blood_glucose_ses.01[participants$participant_id == paste0("sub-", sub)], 
+                     participants$blood_glucose_ses.02[participants$participant_id == paste0("sub-", sub)])
+
+  # Add glucose concentration to dataframe
+  glc_data <- glc_data %>%
+    add_row(
+      ses = ses,
+      sub = sub,
+      condition = condition,
+      task = "rest",
+      trc = "trc",
+      acq = "acq",
+      run = "01",
+      rec = "rec",
+      glc_conc = glc_conc
+    )
+}
+
+})
+```
+
+```{r}
+head(idif_data, n = 6)
+
+idif_data %>% 
+  slice(1:6) %>% 
+  pull(input_feng) %>% 
+  map(plot)
+```
+
+## Loading petprep outputs (TACs and morphology)
+
+```{r}
+petprep_data <- kinfitr::bids_parse_files(file.path(bids_dir, "derivatives/petprep_extract_tacs_smoothed")) %>% 
+  unnest(filedata) %>% 
+  filter(str_detect(path_absolute, "gtmseg"))
+
+tacs <- petprep_data %>% 
+  filter(measurement=="tacs") %>% 
+  filter(is.na(pvc)) %>% 
+  mutate(tacdata = map(path_absolute, ~read_delim(.x, delim="\t", 
+                                                  show_col_types = FALSE)))
+
+morphdata <- petprep_data %>%
+  filter(measurement=="morph") %>%
+  mutate(morphdata = map(path_absolute, ~read_delim(.x, delim="\t",
+                                                  show_col_types = FALSE)))
+```
+
+
+## Creating combined TACs
+
+Now we want to combine regions by volume-weighted averages of the contitutent regions.  
+So we combine the TACs and the region sizes
+
+```{r}
+selected_tacs <- select(tacs, c(ses:rec, tacdata)) %>% 
+  inner_join(select(morphdata, c(ses:rec, morphdata))) %>% 
+  group_by(sub, ses) %>% 
+  mutate(tacdata = map(tacdata, ~pivot_longer(.x, 
+                                              cols = `Left-Cerebral-White-Matter`:`ctx-rh-insula`, 
+                                              names_to = "name", values_to = "TAC"))) %>% 
+  mutate(tacdata = map2(tacdata, morphdata, ~inner_join(.x, .y, by="name")))
+```
+
+## Defining the regions of interest
+
+```{r}
+
+## Whole Cortex
+regions_whole_ctx <-selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "ctx")) %>% 
+  pull(name)
+
+print("Cortex")
+print(regions_whole_ctx)
+
+## Left Cortex
+regions_left_ctx <-selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "ctx-lh")) %>% 
+  pull(name)
+
+## Right Cortex
+regions_right_ctx <-selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "ctx-rh")) %>% 
+  pull(name)
+
+##
+exclude_areas <- c("CSF", "AirCavity", "Skull", "CSF-ExtraCerebral", "Head-ExtraCerebral", "Left-Cerebral-White-Matter", "Left-Cerebellum-White-Matter", "3rd-Ventricle", "4th-Ventricle", "Left-Lateral-Ventricle", "Left-Inf-Lat-Vent", "Right-Lateral-Ventricle", "Right-Inf-Lat-Vent", "Optic-Chiasm")
+regions_whole_brain <- selected_tacs$morphdata[[1]] %>%
+  filter(!str_detect(name, paste(exclude_areas, collapse = "|"))) %>%
+  pull(name)
+print("Whole Brain")
+print(regions_whole_brain)
+
+## Frontal Cortex
+regions_frontal_ctx <- selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "frontal")) %>% 
+  pull(name)
+
+## Insula
+regions_insula <- selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "insula")) %>% 
+  pull(name)
+
+## Striatum
+regions_striatum <- selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "Putamen|Accumbens|Caudate")) %>% 
+  pull(name)
+
+## Hippocampus
+regions_hippocampus <- selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "Hippocampus")) %>% 
+  pull(name)
+
+## Amygdala
+regions_amyg <- selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "Amygdala")) %>% 
+  pull(name)
+
+## Thalamus
+regions_thalamus <- selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "Thalamus")) %>% 
+  pull(name)
+
+## Caudate nucleus
+regions_caudate_nucleus <- selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "Caudate")) %>% 
+  pull(name)
+
+## Putamen
+regions_putamen <- selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "Putamen")) %>% 
+  pull(name)
+
+## Pallidum
+regions_pallidum <- selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "Pallidum")) %>% 
+  pull(name)
+
+## Nucleus accumbens
+regions_nucleus_accumbens <- selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "Accumbens")) %>% 
+  pull(name)
+
+## Choroid plexus
+regions_choroid_plexus <- selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, regex("choroid|plexus", ignore_case = TRUE))) %>% 
+  pull(name)
+
+## Ventral diencephalon
+regions_ventral_diencephalon <- selected_tacs$morphdata[[1]] %>% 
+  filter(str_detect(name, "VentralDC")) %>% 
+  pull(name)
+
+```
+
+Then we perform volume-weighted averaging
+
+```{r}
+volume_weighted_average_tac <- function(tacdata, regions, regionname) {
+  
+  tacdata_combined <- tacdata %>% 
+    filter(name %in% regions) %>% 
+    group_by(frame_start, frame_end) %>% 
+    mutate(volume_tot = sum(`volume-mm3`),
+           volume_frac = `volume-mm3` / volume_tot,
+           TAC_frac = TAC * volume_frac) %>% 
+    summarise(!!regionname := sum(TAC_frac), 
+              .groups = "keep") %>% 
+    ungroup()
+  
+  return(tacdata_combined)
+  
+}
+
+volume_weighted_average_tacs <- function(tacdata, regions_list) {
+  regionnames <- names(regions_list)
+  out <- map2(regions_list, regionnames, ~volume_weighted_average_tac(tacdata, .x, .y))
+  out <- purrr::reduce(out, dplyr::inner_join, by = c("frame_start",
+                                                      "frame_end"))
+  return(out)
+}
+
+regions_list <- list(
+  whole_cortex = regions_whole_ctx,
+  left_cortex = regions_left_ctx,
+  right_cortex = regions_right_ctx,
+  whole_brain = regions_whole_brain,
+  frontal_cortex = regions_frontal_ctx,
+  insula = regions_insula,
+  striatum = regions_striatum,
+  hippocampus = regions_hippocampus,
+  amygdala = regions_amyg,
+  thalamus = regions_thalamus,
+  caudate_nucleus = regions_caudate_nucleus,
+  putamen = regions_putamen,
+  pallidum = regions_pallidum,
+  nucleus_accumbens = regions_nucleus_accumbens,
+  ventral_diencephalon = regions_ventral_diencephalon
+)
+
+if (length(regions_choroid_plexus) > 0) {
+  regions_list$choroid_plexus <- regions_choroid_plexus
+}
+
+regions_vector <- names(regions_list)
+
+selected_tacs <- selected_tacs %>% 
+  group_by(sub, ses) %>% 
+  mutate(selected_tacdata = map(tacdata, ~volume_weighted_average_tacs(.x, 
+                                                                       regions_list)))
+
+## Combining the data
+modeldata <- selected_tacs %>% 
+  select(ses:rec, tacdata = selected_tacdata) %>% 
+  inner_join(idif_data)
+
+```
+
+
+# Fitting TACs
+
+## Preparation
+
+```{r}
+
+### Adding frame midtimes and durations
+modeldata <- modeldata %>% 
+  mutate(tacdata = map(tacdata, ~.x %>% 
+                         mutate(frame_start = frame_start / 60,
+                                frame_end = frame_end / 60) %>% 
+                         mutate(frame_dur = frame_end - frame_start,
+                                frame_mid = frame_start + 0.5*frame_dur)))
+
+
+### Adding weights
+modeldata <- modeldata %>% 
+  mutate(tacdata = map(tacdata, ~.x %>% 
+                         mutate(meanTAC = rowMeans( .x %>% select(whole_brain) )) %>% 
+                         mutate(weights = weights_create(t_start = frame_start,
+                                                         t_end = frame_end,
+                                                         tac = meanTAC,
+                                                         radioisotope = "F18"))))
+```
+
+### Plot the tacs for each region
+```{r}
+#---------------------------------------------------------------------
+# 1) Per-scan / per-region TAC plots
+#---------------------------------------------------------------------
+for (i in seq_len(nrow(modeldata))) {
+  sub  <- modeldata$sub[i]
+  ses  <- modeldata$ses[i]
+  cond <- modeldata$condition[i]
+
+  # dynamic table for this scan (already has frame_mid)
+  tac_df <- modeldata$tacdata[[i]]
+
+  for (reg in regions_vector) {
+    outdir <- file.path(kinfitr_output_dir, "02_Outcomes", "01_TAC_plots", reg)
+    dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+    fname   <- sprintf("sub-%s_ses-%s_%s_desc-%s_TAC.png",
+                       sub, ses, cond, reg)
+    outpath <- file.path(outdir, fname)
+
+    png(outpath, width = 1000, height = 800)
+    print(
+      ggplot(tac_df, aes(x = frame_mid, y = .data[[reg]])) +
+        geom_line(color = "steelblue", linewidth = 1) +
+        geom_point(color = "darkred",  size = 2) +
+        labs(
+          title = sprintf("TAC – %s (sub %s, ses %s, %s)",
+                          reg, sub, ses, cond),
+          x = "Time (min)",
+          y = "Radioactivity (kBq/mL)"
+        ) +
+        theme_bw(base_size = 14)
+    )
+    dev.off()
+    message("Saved: ", outpath)
+  }
+}
+
+#---------------------------------------------------------------------
+# 2) Mean ± SD TAC per region across all scans
+#---------------------------------------------------------------------
+
+# Unnest to: frame_mid × Region × TAC, keeping subject/session/condition
+all_tacs <- modeldata %>%
+  select(sub, ses, condition, tacdata) %>%
+  unnest(tacdata) %>%
+  pivot_longer(
+    cols      = all_of(regions_vector),
+    names_to  = "Region",
+    values_to = "TAC"
+  )
+
+mean_tacs <- all_tacs %>%
+  group_by(Region, frame_mid) %>%
+  summarise(
+    mean_TAC = mean(TAC, na.rm = TRUE),
+    sd_TAC   = sd(TAC,   na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+for (reg in regions_vector) {
+  outdir <- file.path(kinfitr_output_dir, "02_Outcomes", "01_TAC_plots", reg)
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+  outpath <- file.path(outdir,
+                       sprintf("Region-%s_mean_TAC.png", reg))
+
+  df <- filter(mean_tacs, Region == reg)
+
+  png(outpath, width = 1000, height = 800)
+  print(
+    ggplot(df, aes(x = frame_mid, y = mean_TAC)) +
+      geom_ribbon(aes(ymin = mean_TAC - sd_TAC,
+                      ymax = mean_TAC + sd_TAC),
+                  fill = "grey80", alpha = 0.5) +
+      geom_line(color = "steelblue", linewidth = 1.2) +
+      geom_point(color = "darkred", size = 2) +
+      labs(
+        title = paste0("Average TAC – ", reg),
+        x = "Time (min)",
+        y = "Mean radioactivity (kBq/mL)"
+      ) +
+      theme_bw(base_size = 14)
+  )
+  dev.off()
+  message("Saved mean plot: ", outpath)
+}
+```
+
+
+## Save the environment variables to use in later scripts
+```{r}
+# Define folder for processed RDS files
+processed_data_dir <- file.path(kinfitr_output_dir, "01_processed_data")
+dir.create(processed_data_dir, showWarnings = FALSE)
+
+# Save key objects as RDS
+saveRDS(idif_data, file = file.path(processed_data_dir, "idif_data.rds"))
+saveRDS(glc_data, file = file.path(processed_data_dir, "glc_data.rds"))
+saveRDS(volume_weighted_average_tacs, file = file.path(processed_data_dir, "volume_weighted_average_tacs"))
+saveRDS(modeldata, file = file.path(processed_data_dir, "modeldata.rds"))
+
+# Optional intermediates
+saveRDS(selected_tacs, file = file.path(processed_data_dir, "selected_tacs.rds"))
+saveRDS(regions_vector, file = file.path(processed_data_dir, "regions_vector.rds"))
+
+```

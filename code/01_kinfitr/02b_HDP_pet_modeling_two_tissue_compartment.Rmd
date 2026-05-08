@@ -1,0 +1,313 @@
+---
+title: "HDP_pet_modeling_two_tissue_compartment"
+output: html_notebook
+date: "2025-12-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup
+
+## Packages
+
+First we load up the packages we'll be working with
+
+```{r}
+# remotes::install_github("mathesong/bloodstream")
+# remotes::install_github("mathesong/kinfitr")
+
+rm(list = ls())  # Clear all objects from the workspace
+
+library(tidyverse)
+library(bloodstream)
+library(kinfitr)
+library(job)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggpubr)
+library(jsonlite)
+
+theme_set(theme_light())
+
+
+```
+
+# Loading Data
+
+```{r}
+
+find_repo_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  repeat {
+    if (file.exists(file.path(current, "config", "paths.json"))) {
+      return(current)
+    }
+    parent <- dirname(current)
+    if (identical(parent, current)) {
+      stop("Could not locate repo root containing config/paths.json")
+    }
+    current <- parent
+  }
+}
+repo_root <- find_repo_root(getwd())
+source(file.path(repo_root, "code", "utils", "project_paths.R"))
+paths <- load_project_paths(repo_root)
+bids_dir <- paths$bids_root
+kinfitr_output_dir <- file.path(paths$kinfitr_output_root)
+
+# Define the paths relative to the base path
+idif_path <- file.path(bids_dir, "derivatives/idif_aorta")
+participants_file <- file.path(bids_dir, "participants.tsv")
+
+
+# Read the participants.tsv file
+participants <- read.delim(participants_file)
+
+processed_data_dir <- file.path(kinfitr_output_dir, "01_processed_data")
+
+idif_data      <- readRDS(file.path(processed_data_dir, "idif_data.rds"))
+glc_data       <- readRDS(file.path(processed_data_dir, "glc_data.rds"))
+volume_weighted_average_tacs  <- readRDS(file.path(processed_data_dir, "volume_weighted_average_tacs"))
+modeldata      <- readRDS(file.path(processed_data_dir, "modeldata.rds"))
+
+# Optional
+selected_tacs  <- readRDS(file.path(processed_data_dir, "selected_tacs.rds"))
+regions_vector <- readRDS(file.path(processed_data_dir, "regions_vector.rds"))
+```
+
+
+## Fitting TACs
+
+Here we'll use the two tissue compartmental model with irreversible binding
+
+## Try two tissue model with irreverible unspec binding
+
+```{r}
+
+modeldata_long <- modeldata %>%
+     unnest(tacdata) %>%
+     select(-frame_start, -frame_end, -frame_dur, -meanTAC)
+
+modeldata_long <- modeldata_long %>%
+     gather(key = Region, value = TAC, -weights, 
+            -ses, -sub, -task, -trc, -acq, -run, -rec, -condition,
+            -input_idif, -input, -input_feng, -frame_mid)
+
+modeldata_long <- modeldata_long %>%
+     group_by(ses, sub, Region, task, trc, acq, run, rec, condition, input_idif, input) %>%
+     nest(tacdata = -c(ses, sub, Region, task, trc, acq, run, rec, condition, input_idif, input, input_feng))
+
+modeldata_long <- modeldata_long %>% 
+  group_by(sub, condition, Region) %>% 
+  mutate(twotcm_fit = map2(tacdata, input_feng, ~twotcm_irr(t_tac = .x$frame_mid,
+                                             tac = .x$TAC, 
+                                             input= .y, 
+                                             weights = .x$weights, 
+                                             #vB = 0.05,
+                                             multstart_iter = 5)))
+
+saveRDS(modeldata_long, file.path(kinfitr_output_dir, "01_processed_data", "modeldata_Twotissue_irrev.rds"))
+
+```
+
+## Save the workspace after modeling
+```{r}
+dir.create(file.path(kinfitr_output_dir, "workspaces"), recursive = TRUE, showWarnings = FALSE)
+save.image(file = file.path(kinfitr_output_dir, "workspaces", "02b_HDP_pet_modeling_Twotissue_workspace.RData"))  # Save entire workspace to file
+```
+
+## Load workspace to start the script from here
+```{r}
+load(file.path(kinfitr_output_dir, "workspaces", "02b_HDP_pet_modeling_Twotissue_workspace.RData"))
+```
+
+### Plotting
+
+```{r}
+library(purrr)
+library(fs)
+
+# Define model types to loop over
+model_types <- c("twotcm_fit")
+
+for (model_type in model_types) {
+  
+  message("Processing model: ", model_type)
+  
+  for (i in seq_len(nrow(modeldata_long))) {
+    
+    sub  <- modeldata_long$sub[i]
+    ses  <- modeldata_long$ses[i]
+    cond <- modeldata_long$condition[i]
+    reg  <- modeldata_long$Region[i]
+    
+    # Create a model-specific output folder
+    outdir <- file.path(kinfitr_output_dir, "02_Outcomes", "02_model_fits", model_type, reg)
+    dir_create(outdir, recurse = TRUE)
+    
+    # Make a clean filename
+    fname <- sprintf("sub-%s_ses-%s_%s_%s_%s.png",
+                     sub, ses, cond, reg, model_type)
+    
+    outpath <- file.path(outdir, fname)
+    
+    # Open plotting device
+    png(outpath, width = 1000, height = 800)
+    
+    # Plot the model fit
+    fit_obj <- modeldata_long[[model_type]][[i]]
+    if (!is.null(fit_obj)) {
+      print(plot(fit_obj))
+    }
+    
+    dev.off()
+    
+    message("Saved: ", outpath)
+  }
+}
+```
+
+### Outcomes
+
+```{r fig.width=12, fig.height=12}
+
+LC = 0.65
+
+# --- Helper function to extract parameter outcomes from fits ---
+extract_tcm_outcomes <- function(data, fit_col, model_label, glc_data = NULL) {
+  
+  df <- data %>%
+    select(sub, condition, Region, !!sym(fit_col)) %>%
+    mutate(
+      K1 = map_dbl(!!sym(fit_col), c("par", "K1")),
+      k2 = map_dbl(!!sym(fit_col), c("par", "k2")),
+      k3 = map_dbl(!!sym(fit_col), c("par", "k3")),
+      vB = map_dbl(!!sym(fit_col), c("par", "vB"))
+    )
+
+  if (fit_col == "twotcm_fit") {
+    df <- df %>%
+      mutate(
+        Ki  = map_dbl(!!sym(fit_col), c("par", "Ki")),
+        Vnd = map_dbl(!!sym(fit_col), c("par", "Vnd")),
+        Model = "2TCM_Irreversible"
+      )
+    
+    # If glucose data available, compute CMRglc
+    if (!is.null(glc_data)) {
+      df <- df %>%
+        left_join(glc_data %>% select(sub, condition, glc_conc),
+                  by = c("sub", "condition")) %>%
+        mutate(CMRglc_tcm = Ki * glc_conc * 100 / LC) %>%  # µmol/100g/min
+        select(-glc_conc)
+    }
+  }
+  
+  # Remove list-column and reorder columns (Model first)
+  df <- df %>%
+    select(Model, everything(), -!!sym(fit_col))
+  
+  return(df)
+}
+
+# --- Apply extraction for both models ---
+two_tissue_outcomes_all <-
+  extract_tcm_outcomes(modeldata_long, "twotcm_fit", "Irreversible", glc_data)
+
+# --- Save results ---
+write_tsv(two_tissue_outcomes_all,
+          file.path(kinfitr_output_dir, "02_Outcomes", "03_model_outcomes", "2TCM_irreversible.tsv"))
+
+
+# --- Helper function for plotting ---
+plot_and_save <- function(df, metric, ylabel, title, filename) {
+  
+  p <- ggplot(df, aes(x = condition, y = .data[[metric]], colour = sub, group = sub)) +
+    geom_point(size = 3, colour = "black") +
+    geom_point(size = 2.5) +
+    geom_line() +
+    facet_wrap(~Region, scales = "free_y") +
+    labs(x = "Condition", y = ylabel, title = title) +
+    theme_bw(base_size = 13) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.text = element_text(size = 12)
+    )
+  
+  out_dir <- file.path(kinfitr_output_dir, "02_Outcomes", "03_model_outcomes", "plots")
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  ggsave(
+    filename = file.path(out_dir, paste0(filename, ".png")),
+    plot = p, width = 12, height = 8
+  )
+  
+  print(p)
+}
+
+# --- Plot parameters for both model types ---
+metrics_irreversible <- c("K1", "k2", "k3", "Ki", "CMRglc_tcm", "Vnd")
+titles_irreversible  <- c("K1", "k2", "k3", "Ki", "CMRglc", "Vnd")
+
+
+# Plot irreversible
+walk2(metrics_irreversible, titles_irreversible,
+      ~ plot_and_save(two_tissue_outcomes_all %>% filter(Model == "2TCM_Irreversible"),
+                      .x, .x,
+                      paste("Comparison of", .y, "by Condition and Region"),
+                      paste0(.x, "_2TCM_irreversible")))
+
+```
+
+```{r}
+library(effectsize)
+
+# --- CMRglc values ---
+
+# Filter data for Placebo and Verum (CMRglc values) for Whole Brain
+placebo_CMRglc <- two_tissue_outcomes_all %>%
+  filter(condition == "Placebo", Region == "whole_brain") %>%
+  arrange(sub) %>%
+  pull(CMRglc_tcm)
+
+verum_CMRglc <- two_tissue_outcomes_all %>%
+  filter(condition == "Verum", Region == "whole_brain") %>%
+  arrange(sub) %>%
+  pull(CMRglc_tcm)
+
+# Perform a paired t-test
+t_test_result_CMRglc <- t.test(verum_CMRglc, placebo_CMRglc, paired = TRUE, alternative = 'greater', conf.level = 0.95)
+
+# Calculate means and standard deviations
+mean_placebo_CMRglc <- mean(placebo_CMRglc)
+sd_placebo_CMRglc <- sd(placebo_CMRglc)
+
+mean_verum_CMRglc <- mean(verum_CMRglc)
+sd_verum_CMRglc <- sd(verum_CMRglc)
+
+# Calculate mean % increase from placebo to verum
+percent_increase_CMRglc <- ((mean_verum_CMRglc - mean_placebo_CMRglc) / mean_placebo_CMRglc) * 100
+
+# Calculate Cohen's d for paired samples
+cohen_d_CMRglc <- repeated_measures_d(t_test_result_CMRglc, adjust = TRUE, method="z")
+
+# Print results
+print(t_test_result_CMRglc)
+cat("\nMeans and Standard Deviations (CMRglc values):\n")
+cat("Placebo mean:", mean_placebo_CMRglc, "SD:", sd_placebo_CMRglc, "\n")
+cat("Verum mean:", mean_verum_CMRglc, "SD:", sd_verum_CMRglc, "\n")
+cat("Mean % increase from Placebo to Verum:", percent_increase_CMRglc, "%\n")
+cat("95% CI of difference:", t_test_result_CMRglc$conf.int[1], "to", t_test_result_CMRglc$conf.int[2], "\n")
+cat("Cohen's d (paired):", cohen_d_CMRglc$d, "\n")
+
+```
+
+
+
+
+
+
+

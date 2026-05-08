@@ -1,0 +1,4 @@
+{
+    "bids_root": "/absolute/path/to/01_Study_data_Openneuro_v1",
+    "outputs_root": "outputs"
+}

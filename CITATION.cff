@@ -1,0 +1,10 @@
+cff-version: 1.1.0
+message: "This repository is intended as an add-on to the linked published research paper."
+authors:
+  - family-names: "Egger"
+    given-names: "Klemens"
+    affiliation: "University Hospital of Psychiatry Zurich, University of Zurich"
+orcid: https://orcid.org/0000-0001-5072-9674
+title: "HDP FDG PET STUDY"
+version: v1.0
+date-released: 2026-05-08
